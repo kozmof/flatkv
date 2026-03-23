@@ -2,6 +2,7 @@
 
 **Date:** 2026-03-23
 **Target:** `src/flatKV.ts`, `src/flatKV.test.ts`
+**Last updated:** 2026-03-23 (applied fixes P1–P6)
 
 ---
 
@@ -9,7 +10,7 @@
 
 The project is a small TypeScript utility library with a minimal footprint:
 
-- **`src/flatKV.ts`** (147 lines) — single source file containing all types and functions
+- **`src/flatKV.ts`** (176 lines) — single source file containing all types and functions
 - **`src/flatKV.test.ts`** (360 lines) — Vitest test suite
 - **`package.json`** — only defines a `test` script; no build pipeline configured
 - No index/barrel file, no build output, no `tsconfig.json` found at root
@@ -37,6 +38,10 @@ KV<T>
 
 IsValue<T>
   └─ (x: KV<T> | T | T[]) => x is T       (user-provided type guard)
+
+PartialEntry<T>  [private, used inside kvUpdate]
+  └─ { isKvNode: true;  value: KV<T>    }
+   | { isKvNode: false; value: T | T[]  }
 
 Flat<T>  [unexported]
   └─ { [key: string]: T }                  (leaf-only, flat keys)
@@ -76,7 +81,7 @@ exists  [private existence check]
 
 **`makeFlat` scope parameter:** `scope` is a string array that acts as a global key whitelist applied at **every depth level** of traversal (via closure capture). This is subtle — it is not a root-level namespace filter. Any key at any depth that is not in `scope` will be excluded. For example, passing `scope = ['a', 'x']` would include `a:b:...` paths only if `b` is also in scope.
 
-**Delimiter:** Defaults to `':'`. There is no escaping mechanism — if a key itself contains the delimiter character, `revertFlat(makeFlat(kv))` will produce an incorrect result (key splitting will be wrong).
+**Delimiter:** Defaults to `':'`. Keys containing the delimiter character now cause `makeFlat` to throw immediately (see P2 fix). The round-trip `revertFlat(makeFlat(kv))` is guaranteed to be correct as long as no key contains the delimiter.
 
 **Immutability:** `kvGet` and `kvUpdate` are purely functional — they do not mutate inputs. `kvUpdate` uses object spread (`{ ...obj }`) to create shallow copies at each level of the path.
 
@@ -84,73 +89,114 @@ exists  [private existence check]
 
 ## 5. Pitfalls
 
-### P1 — Silent data loss in `makeFlat` for array values
+All six pitfalls identified in the initial analysis have been fixed.
 
-In `dig()` (`flatKV.ts:101–123`):
+### P1 — ~~Silent data loss in `makeFlat` for array values~~ ✅ Fixed
+
+**Was:** In the `dig` inner function, if `next` is a `T[]` and `isValue` does not return `true` for it, the array entry was silently dropped with no error.
+
+**Fix (`flatKV.ts:142–148`):** Added an `else if (Array.isArray(next))` branch that throws with a descriptive message:
 ```ts
-} else {           // not a KV object
-  if (isValue(next)) {
-    flats.push({ flatKey: key, value: next });
-  }
-  // else: silently dropped!
+} else if (Array.isArray(next)) {
+  throw new Error(
+    `makeFlat: array value at key "${key}" is not handled by isValue. ` +
+    `Ensure isValue recognizes all leaf types including arrays.`
+  );
 }
 ```
-If `next` is a `T[]` and `isValue` does not return `true` for arrays (e.g., when `T` is `string` and values include `string[]`), the array entry is **silently dropped** from the flat output. There is no error or warning. This means `revertFlat(makeFlat(kv, isValue))` may not reproduce the original `kv`.
 
-### P2 — Delimiter collision in keys
+---
 
-There is no escaping for the delimiter character in key names. If any key string contains `':'` (or whatever delimiter is used), `revertFlat` will split that key incorrectly, producing a wrong nested structure.
+### P2 — ~~Delimiter collision in keys~~ ✅ Fixed
 
+**Was:** Keys containing the delimiter character (`':'` by default) would corrupt flat key strings, making `revertFlat` produce wrong nested structures with no error.
+
+**Fix (`flatKV.ts:118–123`):** Added a guard at the top of the `dig` loop that throws if any key contains the delimiter:
 ```ts
-// Example — produces wrong revert result
-const kv: KV<string> = { 'a:b': 'value' };
-const flat = makeFlat(kv, isValue);         // { 'a:b': 'value' }
-const reverted = revertFlat(flat, isValue); // { a: { b: 'value' } } ← WRONG
-```
-
-### P3 — `kvUpdate` throws without message (`flatKV.ts:68`)
-
-```ts
-if (!isKv(prevKv) || isValue(prevKv) || Array.isArray(prevKv[prevKey])) {
-  throw new Error();
+if (key.includes(delimiter)) {
+  throw new Error(
+    `makeFlat: key "${key}" contains the delimiter "${delimiter}". ` +
+    `Use a different delimiter or rename the key.`
+  );
 }
 ```
-An unconditional `new Error()` with no message is thrown when an inconsistent internal state is detected during reconstruction. This makes debugging impossible without source-level tracing.
 
-### P4 — `revertFlat` dead code branch (`flatKV.ts:141`)
+---
 
-`kvUpdate` called without `updateIffExists = true` never returns `undefined` (it always creates paths). The `else { return undefined }` branch in `revertFlat` is unreachable under normal usage:
+### P3 — ~~`kvUpdate` throws without message~~ ✅ Fixed
 
+**Was:** `throw new Error()` with no message made the error impossible to diagnose.
+
+**Fix (`flatKV.ts:78–81`):** The throw now includes the offending key and the full traversed key path:
 ```ts
-if (kv !== undefined) {
-  kv = kvUpdate(kv, flatKey.split(delimiter), value, isValue);
+throw new Error(
+  `kvUpdate: expected a KV node at key "${prevKey}" but found a leaf value. ` +
+  `Key path: [${keys.slice(0, i).join(', ')}]`
+);
+```
+
+---
+
+### P4 — ~~`revertFlat` dead code branch~~ ✅ Fixed
+
+**Was:** The loop structure checked `if (kv !== undefined)` before calling `kvUpdate`, with an unreachable `else { return undefined }` because `kvUpdate` without `updateIffExists=true` never returns `undefined`.
+
+**Fix (`flatKV.ts:169–174`):** Restructured to call `kvUpdate`, check its result explicitly, then assign:
+```ts
+let kv: KV<T> = {};
+for (const [flatKey, value] of Object.entries(flat)) {
+  const next = kvUpdate(kv, flatKey.split(delimiter), value, isValue);
+  if (next === undefined) return undefined;
+  kv = next;
+}
+```
+
+---
+
+### P5 — ~~Typo `updateIffExits`~~ ✅ Fixed
+
+**Was:** Parameter name `updateIffExits` (typo: "Exits").
+
+**Fix (`flatKV.ts:42, 57`):** Renamed to `updateIffExists` at the parameter declaration and its usage inside the function body.
+
+---
+
+### P6 — ~~`isValue(prevKv)` false-positive for object-typed `T`~~ ✅ Fixed
+
+**Was:** In `kvUpdate`'s rebuild loop, the guard `isValue(prevKv)` was used to detect whether a `partials` entry was a leaf value instead of a KV node. When `T` is an object type, this could false-positive: a legitimate KV subtree that happens to satisfy `isValue` would cause the function to throw incorrectly.
+
+**Fix (`flatKV.ts:33–35, 44, 50–53, 73–77`):** Introduced the private `PartialEntry<T>` tagged union. The forward traversal now explicitly tags each `partials` entry as `isKvNode: true` or `isKvNode: false` at the point it is pushed. The rebuild loop checks `prevEntry.isKvNode` directly instead of re-running `isValue`:
+```ts
+type PartialEntry<T> =
+  | { isKvNode: true;  value: KV<T>   }
+  | { isKvNode: false; value: T | T[] };
+```
+```ts
+// forward loop — tagging on push
+if (isValue(child) || Array.isArray(child)) {
+  partials.push({ isKvNode: false, value: child as T | T[] });
 } else {
-  return undefined; // ← unreachable in practice
+  partials.push({ isKvNode: true, value: { ...(child as KV<T>) } });
 }
 ```
-
-### P5 — Typo in parameter name (`flatKV.ts:35`)
-
 ```ts
-updateIffExits: boolean = false   // "Exits" should be "Exists"
+// rebuild loop — flag-based check, no isValue call
+if (!prevEntry.isKvNode || Array.isArray(prevEntry.value[prevKey ...])) {
+  throw new Error(...);
+}
 ```
-
-### P6 — `isKv` type guard triggers false-positive for object-typed `T`
-
-When `T` is itself an object type (not a primitive), `isKv(value)` returns `true` for any plain object — including leaf values of type `T`. The library relies on `isValue` being called after `isKv` in the right order to disambiguate, but this ordering is fragile and not enforced by the type system.
 
 ---
 
 ## 6. Improvement Points — Design Overview
 
 **I. Formalize the round-trip guarantee.**
-`makeFlat` and `revertFlat` are inverse operations, but this is not guaranteed to be lossless (see P1, P2). A documented contract or a `roundTrip(kv, isValue, delimiter)` test helper would clarify under which conditions the round-trip holds.
+`makeFlat` and `revertFlat` are inverse operations. With P1 and P2 fixed, the round-trip is now fail-fast rather than silently lossy, but it is still not guaranteed lossless for all inputs. A documented contract or a `roundTrip(kv, isValue, delimiter)` test helper would clarify the exact preconditions.
 
 **II. Reconsider `scope` semantics.**
 The `scope` parameter in `makeFlat` acts as a global key whitelist applied at every depth, which is non-obvious. Consider renaming it (`keyWhitelist`, `allowedKeys`) or redesigning it to operate only at the root level (scoping top-level namespaces).
 
-**III. Delimiter safety.**
-Either document that keys must not contain the delimiter character, or provide an escape/encode mechanism. Alternatively, accept an explicit encoding function instead of a raw delimiter string.
+**III. ~~Delimiter safety.~~** ✅ Addressed by P2 fix — `makeFlat` now throws on key/delimiter collision.
 
 **IV. Consider a "codec" pattern.**
 Pairing `makeFlat`/`revertFlat` into a `FlatKVCodec` object with explicit encode/decode methods would make the relationship clearer and allow configuration (delimiter, isValue) to be set once rather than passed at every call site.
@@ -176,20 +222,19 @@ Overloaded signatures could encode the `updateIffExists` flag in the type, makin
 ## 8. Improvement Points — Implementations
 
 **I. `kvUpdate` forward traversal doesn't advance `partial` for missing keys.**
-When a key is not found (lines `flatKV.ts:48–54`), `partials` receives a placeholder `{ [key]: {} }` but `partial` is not advanced. This means all subsequent missing-key iterations push new placeholders while `partial` stays at the last found node. This happens to produce correct results because the rebuild loop merges placeholders correctly via `{ ...undefined }` spread, but the implementation is very hard to reason about. The forward pass logic should be made explicit.
+When a key is not found (`flatKV.ts:56–62`), `partials` receives a placeholder `{ isKvNode: true, value: { [key]: {} } }` but `partial` is not advanced. This means all subsequent missing-key iterations push new placeholders while `partial` stays at the last found node. This happens to produce correct results because the rebuild loop merges placeholders correctly via `{ ...undefined }` spread, but the implementation is hard to reason about. The forward pass logic should be made explicit.
 
 **II. `kvUpdate` rebuild loop is complex — consider recursion.**
-The backward reconstruction loop (`flatKV.ts:58–80`) manages index arithmetic, edge cases for `i - 1 < 0`, and three separate spread branches for value vs array vs KV. A recursive implementation would naturally express the same logic with clearer termination conditions.
+The backward reconstruction loop (`flatKV.ts:66–94`) manages index arithmetic, edge cases for `i - 1 < 0`, and three separate spread branches for value vs array vs KV. A recursive implementation would naturally express the same logic with clearer termination conditions.
 
 **III. `exists` checks only `undefined`, not `null` (`flatKV.ts:9–11`).**
-If `null` is stored as a value in a `KV<T>` (which is possible when `T` extends `null | ...`), `exists` would return `true` and `isKv` would return `false`, causing the value to be treated as a non-KV, non-existent node in `kvGet`. This is an edge case but worth documenting or guarding.
+If `null` is stored as a value in a `KV<T>` (possible when `T` extends `null | ...`), `exists` would return `true` and `isKv` would return `false`, causing the value to be treated as a non-KV, non-existent node in `kvGet`. This is an edge case but worth documenting or guarding.
 
-**IV. `throw new Error()` should include diagnostic context (`flatKV.ts:68`).**
-At minimum, the error should include the key path and the problematic value type.
+**IV. ~~`throw new Error()` should include diagnostic context.~~** ✅ Addressed by P3 fix.
 
-**V. Duplicate shallow copy of `kv` at the start of `kvUpdate` (`flatKV.ts:37–38`).**
+**V. Duplicate shallow copy of `kv` at the start of `kvUpdate` (`flatKV.ts:44–45`).**
 ```ts
-const partials: (KV<T> | T | T[])[] = [{ ...kv }];
+const partials: PartialEntry<T>[] = [{ isKvNode: true, value: { ...kv } }];
 let partial: KV<T> | T | T[] = { ...kv };
 ```
 Two spread copies of `kv` are made. `partials[0]` is used in the merge step at `i - 1 < 0`; `partial` is used for traversal. Only one copy is needed if the logic were restructured.
@@ -203,21 +248,23 @@ Two spread copies of `kv` are made. `partials[0]` is used in the merge step at `
 - Note: the initial spread `{ ...kv }` is unnecessary since `kvGet` never mutates.
 
 ### Entry: `makeFlat` — recursive flattening
-- Start at `flatKV.ts:88`. Follow the `dig` inner function.
+- Start at `flatKV.ts:102`. Follow the `dig` inner function.
 - Understand why `isValue` must be passed: the library cannot infer what constitutes a leaf.
+- Note the delimiter guard (P2 fix) at line 118 and the array guard (P1 fix) at line 142.
 - Observe how `scope` works as a closure-captured global filter.
-- Trace `revertFlat` (`flatKV.ts:132`) to see how it rebuilds the tree via `kvUpdate`.
+- Trace `revertFlat` (`flatKV.ts:161`) to see how it rebuilds the tree via `kvUpdate`.
 
 ### Entry: `kvUpdate` — core mutation logic (most complex)
-- Start at `flatKV.ts:30`.
-- Phase 1 (forward, lines 40–55): builds up `partials` stack, tracing the path.
-- Phase 2 (backward, lines 58–80): reconstructs the new tree from the leaf up to the root.
-- Key insight: when a path segment is missing and `updateIffExists = false`, a placeholder `{ [key]: {} }` is pushed, and the rebuild step handles it correctly via spread of `undefined`.
-- **Goal:** understand why `partials[i - 1]` at the merge step always refers to the *parent* node snapshot, not the mutated one.
+- Start at `flatKV.ts:37`.
+- Phase 1 (forward, lines 47–62): builds up the `PartialEntry<T>[]` stack, tagging each entry as KV node or leaf.
+- Phase 2 (backward, lines 66–94): reconstructs the new tree from the leaf up to the root.
+- Key insight: when a path segment is missing and `updateIffExists = false`, a placeholder `{ isKvNode: true, value: { [key]: {} } }` is pushed, and the rebuild step handles it correctly via `{ ...undefined }` spread.
+- **Goal:** understand why the `isKvNode` tag (P6 fix) is necessary when `T` is an object type.
 
 ### Goal: understand the round-trip guarantee
 - Trace `makeFlat` → `revertFlat` → compare to original `kv`.
-- Identify conditions under which the round-trip is **not** lossless: array values where `isValue` returns false, keys containing the delimiter character.
+- The round-trip is lossless when: all leaf values satisfy `isValue`, and no key contains the delimiter.
+- With the P1 and P2 fixes in place, violations of these preconditions now throw rather than silently corrupt data.
 - Review the `revertFlat` test in `flatKV.test.ts:331` for the canonical happy-path example.
 
 ---

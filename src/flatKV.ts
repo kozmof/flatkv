@@ -27,46 +27,54 @@ export function kvGet<T>(
 
 export type IsValue<T> = (x: KV<T> | T | T[]) => x is T;
 
+type PartialEntry<T> =
+  | { isKvNode: true; value: KV<T> }
+  | { isKvNode: false; value: T | T[] };
+
 export function kvUpdate<T>(
   kv: KV<T>,
   keys: string[],
   value: T | T[] | KV<T>,
   isValue: IsValue<T>,
-  updateIffExits: boolean = false
+  updateIffExists: boolean = false
 ): KV<T> | undefined {
-  const partials: (KV<T> | T | T[])[] = [{ ...kv }];
+  const partials: PartialEntry<T>[] = [{ isKvNode: true, value: { ...kv } }];
   let partial: KV<T> | T | T[] = { ...kv };
 
   for (const key of keys) {
     if (isKv(partial) && exists(partial[key])) {
-      if (isValue(partial[key]) || Array.isArray(partial[key])) {
-        partials.push(partial[key]);
+      const child: T | T[] | KV<T> = partial[key];
+      if (isValue(child) || Array.isArray(child)) {
+        partials.push({ isKvNode: false, value: child as T | T[] });
       } else {
-        partials.push({ ...partial[key] });
+        partials.push({ isKvNode: true, value: { ...(child as KV<T>) } });
       }
-      partial = partial[key];
+      partial = child;
     } else {
-      if (updateIffExits) {
+      if (updateIffExists) {
         return undefined;
       } else {
-        partials.push({ [key]: {} });
+        partials.push({ isKvNode: true, value: { [key]: {} } });
       }
     }
   }
-  let newKv: KV<T> = { [keys[keys.length - 1]]: value }; // last one
+  let newKv: KV<T> = { [keys[keys.length - 1]]: value };
 
   for (let i = keys.length - 1; i >= 0; i--) {
     const key = keys[i];
     const prevKey = keys[i - 1];
-    const prevKv = partials[i - 1];
 
-    // prevKv === undefined
     if (i - 1 < 0) {
       newKv = { ...kv, ...newKv };
     } else {
-      if (!isKv(prevKv) || isValue(prevKv) || Array.isArray(prevKv[prevKey])) {
-        throw new Error();
+      const prevEntry = partials[i - 1];
+      if (!prevEntry.isKvNode || Array.isArray(prevEntry.value[prevKey as keyof typeof prevEntry.value])) {
+        throw new Error(
+          `kvUpdate: expected a KV node at key "${prevKey}" but found a leaf value. ` +
+          `Key path: [${keys.slice(0, i).join(', ')}]`
+        );
       }
+      const prevKv = prevEntry.value;
 
       const val = newKv[key];
       if (Array.isArray(val)) {
@@ -99,6 +107,12 @@ export function makeFlat<T>(
   }[] => {
     let flats: { flatKey: string; value: T }[] = [];
     for (const key of Object.keys(kv)) {
+      if (key.includes(delimiter)) {
+        throw new Error(
+          `makeFlat: key "${key}" contains the delimiter "${delimiter}". ` +
+          `Use a different delimiter or rename the key.`
+        );
+      }
       if (scope.length === 0 || scope.includes(key)) {
         const next = kv[key];
         if (isKv(next)) {
@@ -117,6 +131,11 @@ export function makeFlat<T>(
         } else {
           if (isValue(next)) {
             flats.push({ flatKey: key, value: next });
+          } else if (Array.isArray(next)) {
+            throw new Error(
+              `makeFlat: array value at key "${key}" is not handled by isValue. ` +
+              `Ensure isValue recognizes all leaf types including arrays.`
+            );
           }
         }
       }
@@ -134,13 +153,11 @@ export function revertFlat<T>(
   isValue: IsValue<T>,
   delimiter: string = ':'
 ): KV<T> | undefined {
-  let kv: KV<T> | undefined = {};
+  let kv: KV<T> = {};
   for (const [flatKey, value] of Object.entries(flat)) {
-    if (kv !== undefined) {
-      kv = kvUpdate(kv, flatKey.split(delimiter), value, isValue);
-    } else {
-      return undefined;
-    }
+    const next = kvUpdate(kv, flatKey.split(delimiter), value, isValue);
+    if (next === undefined) return undefined;
+    kv = next;
   }
   return kv;
 }
