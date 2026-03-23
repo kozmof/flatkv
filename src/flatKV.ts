@@ -7,14 +7,14 @@ function isKv<T>(value: KV<T> | T | T[]): value is KV<T> {
 }
 
 function exists<T>(value: KV<T> | T | T[]): boolean {
-  return value !== undefined;
+  return value !== undefined && value !== null;
 }
 
 export function kvGet<T>(
   kv: KV<T>,
   keys: string[]
 ): T | KV<T> | T[] | undefined {
-  let target: KV<T> | T | T[] = { ...kv };
+  let target: KV<T> | T | T[] = kv;
   for (const key of keys) {
     if (isKv(target) && exists(target[key])) {
       target = target[key];
@@ -36,10 +36,25 @@ export function kvUpdate<T>(
   keys: string[],
   value: T | T[] | KV<T>,
   isValue: IsValue<T>,
+  updateIffExists: true
+): KV<T> | undefined;
+export function kvUpdate<T>(
+  kv: KV<T>,
+  keys: string[],
+  value: T | T[] | KV<T>,
+  isValue: IsValue<T>,
+  updateIffExists?: false
+): KV<T>;
+export function kvUpdate<T>(
+  kv: KV<T>,
+  keys: string[],
+  value: T | T[] | KV<T>,
+  isValue: IsValue<T>,
   updateIffExists: boolean = false
 ): KV<T> | undefined {
-  const partials: PartialEntry<T>[] = [{ isKvNode: true, value: { ...kv } }];
-  let partial: KV<T> | T | T[] = { ...kv };
+  const initialValue: KV<T> = { ...kv };
+  const partials: PartialEntry<T>[] = [{ isKvNode: true, value: initialValue }];
+  let partial: KV<T> | T | T[] = initialValue;
 
   for (const key of keys) {
     if (isKv(partial) && exists(partial[key])) {
@@ -89,7 +104,7 @@ export function kvUpdate<T>(
   return newKv;
 }
 
-type Flat<T> = {
+export type Flat<T> = {
   [flatKey in string]: T;
 };
 
@@ -152,12 +167,10 @@ export function revertFlat<T>(
   flat: Flat<T>,
   isValue: IsValue<T>,
   delimiter: string = ':'
-): KV<T> | undefined {
+): KV<T> {
   let kv: KV<T> = {};
   for (const [flatKey, value] of Object.entries(flat)) {
-    const next = kvUpdate(kv, flatKey.split(delimiter), value, isValue);
-    if (next === undefined) return undefined;
-    kv = next;
+    kv = kvUpdate(kv, flatKey.split(delimiter), value, isValue);
   }
   return kv;
 }

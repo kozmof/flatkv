@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-23
 **Target:** `src/flatKV.ts`, `src/flatKV.test.ts`
-**Last updated:** 2026-03-23 (applied fixes P1–P6)
+**Last updated:** 2026-03-24 (applied fixes 7.I, 7.IV, 8.III, 8.V, kvGet spread; investigated 7.III)
 
 ---
 
@@ -10,7 +10,7 @@
 
 The project is a small TypeScript utility library with a minimal footprint:
 
-- **`src/flatKV.ts`** (176 lines) — single source file containing all types and functions
+- **`src/flatKV.ts`** (163 lines) — single source file containing all types and functions
 - **`src/flatKV.test.ts`** (360 lines) — Vitest test suite
 - **`package.json`** — only defines a `test` script; no build pipeline configured
 - No index/barrel file, no build output, no `tsconfig.json` found at root
@@ -26,7 +26,7 @@ The library provides four primary operations on nested key-value structures:
 | `makeFlat` | Function | Flatten nested KV to `delimiter`-joined string keys |
 | `revertFlat` | Function | Reconstruct nested KV from flat representation |
 
-`Flat<T>` is used internally as the return type of `makeFlat` but is **not exported**.
+`Flat<T>` is the return type of `makeFlat` and is **exported**.
 
 ---
 
@@ -43,7 +43,7 @@ PartialEntry<T>  [private, used inside kvUpdate]
   └─ { isKvNode: true;  value: KV<T>    }
    | { isKvNode: false; value: T | T[]  }
 
-Flat<T>  [unexported]
+Flat<T>  [exported]
   └─ { [key: string]: T }                  (leaf-only, flat keys)
 ```
 
@@ -137,17 +137,32 @@ throw new Error(
 
 ---
 
-### P4 — ~~`revertFlat` dead code branch~~ ✅ Fixed
+### P4 — ~~`revertFlat` dead code branch~~ ✅ Fixed (further improved 2026-03-24)
 
 **Was:** The loop structure checked `if (kv !== undefined)` before calling `kvUpdate`, with an unreachable `else { return undefined }` because `kvUpdate` without `updateIffExists=true` never returns `undefined`.
 
-**Fix (`flatKV.ts:169–174`):** Restructured to call `kvUpdate`, check its result explicitly, then assign:
+**Fix (2026-03-23, `flatKV.ts:169–174`):** Restructured to call `kvUpdate`, check its result explicitly, then assign:
 ```ts
 let kv: KV<T> = {};
 for (const [flatKey, value] of Object.entries(flat)) {
   const next = kvUpdate(kv, flatKey.split(delimiter), value, isValue);
   if (next === undefined) return undefined;
   kv = next;
+}
+```
+
+**Further improvement (2026-03-24):** After adding overloaded signatures to `kvUpdate` (see 7.IV fix), the `if (next === undefined) return undefined` check became statically dead code — TypeScript now knows `kvUpdate` called without `updateIffExists` always returns `KV<T>`. The intermediate `next` variable was removed and `revertFlat`'s return type simplified from `KV<T> | undefined` to `KV<T>` (`flatKV.ts:153–163`):
+```ts
+export function revertFlat<T>(
+  flat: Flat<T>,
+  isValue: IsValue<T>,
+  delimiter: string = ':'
+): KV<T> {
+  let kv: KV<T> = {};
+  for (const [flatKey, value] of Object.entries(flat)) {
+    kv = kvUpdate(kv, flatKey.split(delimiter), value, isValue);
+  }
+  return kv;
 }
 ```
 
@@ -205,17 +220,22 @@ Pairing `makeFlat`/`revertFlat` into a `FlatKVCodec` object with explicit encode
 
 ## 7. Improvement Points — Types and Interfaces
 
-**I. Export `Flat<T>`.**
-`Flat<T>` is the return type of `makeFlat` but is not exported. Users who want to type variables holding flat results must use `ReturnType<typeof makeFlat>` or `Record<string, T>`.
+**I. ~~Export `Flat<T>`.~~** ✅ Fixed
+`Flat<T>` is now exported (`flatKV.ts:102`). Users can import it directly to type flat-keyed result variables.
 
 **II. `IsValue<T>` should clarify its responsibility toward arrays.**
 The type `(x: KV<T> | T | T[]) => x is T` accepts `T[]` as input but asserts `T`. For the common case of `T = string[]`, the guard input would include `string[][]`. Consider a separate `IsValueArray<T>` or a union guard `(x) => x is T | T[]`.
 
-**III. `KV<T>` could be narrowed at the type level.**
-The type currently allows `null` to be assignable as `T`. Adding `T extends NonNullable<unknown>` constraint would prevent a class of runtime bugs since `isKv` explicitly rejects `null`.
+**III. `KV<T>` could be narrowed at the type level.** ⚠️ Investigated — not applied
+Adding `T extends NonNullable<unknown>` to `KV<T>` (and propagating it to all generic functions) was attempted but rejected: because `T extends {}` makes `T` a potentially object-shaped type, TypeScript's type narrowing inside `isKv` guards breaks — after `isKv(target)` is true, TypeScript no longer fully excludes `T` from the narrowed type (since `T` could overlap with `KV<T>`), resulting in errors like "can't be used to index type `T | KV<T>`". The runtime protection is partially covered by the `exists` null fix (see 8.III). This constraint would require re-architecting `isKv` (e.g., accepting `unknown` as input) before it becomes viable.
 
-**IV. `kvUpdate` return type is `KV<T> | undefined`.**
-Overloaded signatures could encode the `updateIffExists` flag in the type, making the return type `KV<T>` when `updateIffExists = false` and `KV<T> | undefined` when `true`.
+**IV. ~~`kvUpdate` return type is `KV<T> | undefined`.~~** ✅ Fixed
+Two overload signatures now encode the `updateIffExists` flag in the return type (`flatKV.ts:35–47`):
+```ts
+export function kvUpdate<T>(..., updateIffExists: true): KV<T> | undefined;
+export function kvUpdate<T>(..., updateIffExists?: false): KV<T>;
+```
+Callers that omit or pass `false` get `KV<T>` (no narrowing needed at call sites); callers that pass `true` get `KV<T> | undefined`. This also enabled the `revertFlat` return type simplification (see P4).
 
 ---
 
@@ -227,17 +247,19 @@ When a key is not found (`flatKV.ts:56–62`), `partials` receives a placeholder
 **II. `kvUpdate` rebuild loop is complex — consider recursion.**
 The backward reconstruction loop (`flatKV.ts:66–94`) manages index arithmetic, edge cases for `i - 1 < 0`, and three separate spread branches for value vs array vs KV. A recursive implementation would naturally express the same logic with clearer termination conditions.
 
-**III. `exists` checks only `undefined`, not `null` (`flatKV.ts:9–11`).**
-If `null` is stored as a value in a `KV<T>` (possible when `T` extends `null | ...`), `exists` would return `true` and `isKv` would return `false`, causing the value to be treated as a non-KV, non-existent node in `kvGet`. This is an edge case but worth documenting or guarding.
+**III. ~~`exists` checks only `undefined`, not `null`.~~** ✅ Fixed
+`exists` now returns `value !== undefined && value !== null` (`flatKV.ts:10`). A `null` value stored in a `KV<T>` is now correctly treated as absent, consistent with how `isKv` already rejects `null`.
 
 **IV. ~~`throw new Error()` should include diagnostic context.~~** ✅ Addressed by P3 fix.
 
-**V. Duplicate shallow copy of `kv` at the start of `kvUpdate` (`flatKV.ts:44–45`).**
+**V. ~~Duplicate shallow copy of `kv` at the start of `kvUpdate`.~~** ✅ Fixed
+The two `{ ...kv }` spreads were collapsed into one via a named intermediate (`flatKV.ts:53–55`):
 ```ts
-const partials: PartialEntry<T>[] = [{ isKvNode: true, value: { ...kv } }];
-let partial: KV<T> | T | T[] = { ...kv };
+const initialValue: KV<T> = { ...kv };
+const partials: PartialEntry<T>[] = [{ isKvNode: true, value: initialValue }];
+let partial: KV<T> | T | T[] = initialValue;
 ```
-Two spread copies of `kv` are made. `partials[0]` is used in the merge step at `i - 1 < 0`; `partial` is used for traversal. Only one copy is needed if the logic were restructured.
+`partials[0].value` and `partial` now reference the same object. `kv` is copied exactly once.
 
 ---
 
@@ -245,19 +267,19 @@ Two spread copies of `kv` are made. `partials[0]` is used in the merge step at `
 
 ### Entry: `kvGet` — simplest function
 - Start at `flatKV.ts:13`. Understand how `isKv` and `exists` cooperate to safely traverse the tree.
-- Note: the initial spread `{ ...kv }` is unnecessary since `kvGet` never mutates.
+- The initial `{ ...kv }` spread was removed; `target` is initialized directly to `kv` since `kvGet` never mutates.
 
 ### Entry: `makeFlat` — recursive flattening
-- Start at `flatKV.ts:102`. Follow the `dig` inner function.
+- Start at `flatKV.ts:107`. Follow the `dig` inner function.
 - Understand why `isValue` must be passed: the library cannot infer what constitutes a leaf.
-- Note the delimiter guard (P2 fix) at line 118 and the array guard (P1 fix) at line 142.
+- Note the delimiter guard (P2 fix) at line 110 and the array guard (P1 fix) at line 134.
 - Observe how `scope` works as a closure-captured global filter.
-- Trace `revertFlat` (`flatKV.ts:161`) to see how it rebuilds the tree via `kvUpdate`.
+- Trace `revertFlat` (`flatKV.ts:153`) to see how it rebuilds the tree via `kvUpdate`.
 
 ### Entry: `kvUpdate` — core mutation logic (most complex)
-- Start at `flatKV.ts:37`.
-- Phase 1 (forward, lines 47–62): builds up the `PartialEntry<T>[]` stack, tagging each entry as KV node or leaf.
-- Phase 2 (backward, lines 66–94): reconstructs the new tree from the leaf up to the root.
+- Start at `flatKV.ts:35`. The first two signatures (lines 35–47) are overloads; the implementation begins at line 48.
+- Phase 1 (forward, lines 57–70): builds up the `PartialEntry<T>[]` stack, tagging each entry as KV node or leaf.
+- Phase 2 (backward, lines 73–99): reconstructs the new tree from the leaf up to the root.
 - Key insight: when a path segment is missing and `updateIffExists = false`, a placeholder `{ isKvNode: true, value: { [key]: {} } }` is pushed, and the rebuild step handles it correctly via `{ ...undefined }` spread.
 - **Goal:** understand why the `isKvNode` tag (P6 fix) is necessary when `T` is an object type.
 
@@ -269,4 +291,4 @@ Two spread copies of `kv` are made. `partials[0]` is used in the merge step at `
 
 ---
 
-*Generated by Claude Code (claude-sonnet-4-6) on 2026-03-23.*
+*Generated by Claude Code (claude-sonnet-4-6) on 2026-03-23. Updated 2026-03-24.*
